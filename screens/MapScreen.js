@@ -1,296 +1,347 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, Platform } from 'react-native';
 import MapView, { Marker, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
 
 const MapScreen = () => {
-  const [location, setLocation] = useState(null);
+  const mapRef = useRef(null);
+  const [region, setRegion] = useState({
+    latitude: -23.5505,  // São Paulo como fallback
+    longitude: -46.6333,
+    latitudeDelta: 0.0922,
+    longitudeDelta: 0.0421,
+  });
   const [searchQuery, setSearchQuery] = useState('');
   const [errorMsg, setErrorMsg] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [origin, setOrigin] = useState(null);
   const [destination, setDestination] = useState(null);
   const [route, setRoute] = useState([]);
   const [distance, setDistance] = useState(null);
 
+  // 1. Obter localização inicial
   useEffect(() => {
-    const getLocation = async () => {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        setErrorMsg('Permissão de localização negada');
+    (async () => {
+      try {
+        setLoading(true);
+        
+        // Verificar permissão
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          setErrorMsg('Permissão de localização negada');
+          return;
+        }
+
+        // Obter localização atual
+        const location = await Location.getCurrentPositionAsync({});
+        const newRegion = {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          latitudeDelta: 0.0922,
+          longitudeDelta: 0.0421,
+        };
+        
+        setRegion(newRegion);
+        setOrigin({
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+        });
+
+      } catch (error) {
+        console.error('Erro ao obter localização:', error);
+        setErrorMsg('Não foi possível obter a localização');
+      } finally {
         setLoading(false);
-        return;
       }
-
-      let location = await Location.getCurrentPositionAsync({});
-      setLocation({
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      });
-      setLoading(false);
-    };
-
-    getLocation();
+    })();
   }, []);
 
+  // 2. Ajustar visualização do mapa quando destino muda
+  useEffect(() => {
+    if (destination && origin && mapRef.current) {
+      mapRef.current.fitToCoordinates([origin, destination], {
+        edgePadding: { top: 100, right: 100, bottom: 100, left: 100 },
+        animated: true,
+      });
+    }
+  }, [destination, origin]);
+
+  // 3. Buscar localização pelo texto
   const searchLocation = async () => {
-    if (!searchQuery) return;
+    if (!searchQuery.trim()) {
+      Alert.alert('Aviso', 'Digite um local para buscar');
+      return;
+    }
 
     setLoading(true);
-    const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(searchQuery)}`;
+    setErrorMsg(null);
 
     try {
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'geolocationapp/1.0 (contato@meuemail.com)',
-          'Accept-Language': 'pt-BR',
-        },
-      });
+      // Usar Nominatim API
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(searchQuery)}&limit=1`,
+        {
+          headers: {
+            'User-Agent': 'MyApp/1.0 (myemail@example.com)',
+            'Accept-Language': 'pt-BR',
+          },
+        }
+      );
+
+      if (!response.ok) throw new Error('Erro na requisição');
+
       const data = await response.json();
+      if (!data || data.length === 0) throw new Error('Local não encontrado');
 
-      if (data.length > 0) {
-        const place = data[0];
-        setDestination({
-          latitude: parseFloat(place.lat),
-          longitude: parseFloat(place.lon),
-        });
+      const newDestination = {
+        latitude: parseFloat(data[0].lat),
+        longitude: parseFloat(data[0].lon),
+      };
 
-        fetchRoute({
-          latitude: parseFloat(place.lat),
-          longitude: parseFloat(place.lon),
-        });
-      }
+      setDestination(newDestination);
+      await fetchRoute(newDestination);
+
     } catch (error) {
-      console.error('Erro ao buscar local:', error);
+      console.error('Erro na busca:', error);
+      setErrorMsg(error.message);
+      Alert.alert('Erro', error.message);
     } finally {
       setLoading(false);
     }
   };
 
-  const fetchRoute = async (destination) => {
-    if (!origin || !destination) return;
-
-    // Certifique-se de passar longitude,latitude na URL para a API OSRM
-    const url = `https://router.project-osrm.org/route/v1/driving/${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}?overview=full&geometries=polyline`;
+  // 4. Calcular rota
+  const fetchRoute = async (dest) => {
+    if (!origin || !dest) return;
 
     try {
-      const response = await fetch(url);
+      const response = await fetch(
+        `https://router.project-osrm.org/route/v1/driving/${origin.longitude},${origin.latitude};${dest.longitude},${dest.latitude}?overview=full&geometries=geojson`
+      );
+
+      if (!response.ok) throw new Error('Erro ao calcular rota');
+
       const data = await response.json();
-      if (data.routes && data.routes.length > 0) {
-        const polyline = data.routes[0].geometry;
-        const coordinates = decodePolyline(polyline);
-        setRoute(coordinates);
+      if (!data.routes || data.routes.length === 0) throw new Error('Rota não disponível');
 
-        // Corrigir a ordem das coordenadas ao calcular a distância
-        const dist = calculateDistance(origin.latitude, origin.longitude, destination.latitude, destination.longitude);
-        setDistance(dist);
-      }
+      // Decodificar rota
+      const coordinates = data.routes[0].geometry.coordinates.map(coord => ({
+        latitude: coord[1],
+        longitude: coord[0],
+      }));
+
+      setRoute(coordinates);
+      setDistance((data.routes[0].distance / 1000).toFixed(2) + ' km');
+
     } catch (error) {
-      console.error('Erro ao calcular rota:', error);
+      console.error('Erro na rota:', error);
+      setErrorMsg(error.message);
     }
   };
 
-  const decodePolyline = (encoded) => {
-    let len = encoded.length;
-    let index = 0;
-    let lat = 0;
-    let lng = 0;
-    let coordinates = [];
-
-    while (index < len) {
-      let b, shift = 0, result = 0;
-      do {
-        b = encoded.charCodeAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      let deltaLat = (result & 1) ? ~(result >> 1) : (result >> 1);
-      lat += deltaLat;
-
-      shift = 0;
-      result = 0;
-      do {
-        b = encoded.charCodeAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      let deltaLng = (result & 1) ? ~(result >> 1) : (result >> 1);
-      lng += deltaLng;
-
-      coordinates.push({
-        latitude: (lat / 1E5),
-        longitude: (lng / 1E5),
-      });
-    }
-
-    return coordinates;
-  };
-
-  const handlePress = (e) => {
-    const { coordinate } = e.nativeEvent;
-
-    if (!origin) {
-      setOrigin(coordinate);
-    } else if (!destination) {
-      setDestination(coordinate);
-      fetchRoute(coordinate);
-    }
-  };
-
+  // 5. Função para localização atual
   const locateMe = async () => {
-    let { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== 'granted') {
-      setErrorMsg('Permissão de localização negada');
-      return;
+    try {
+      setLoading(true);
+      const location = await Location.getCurrentPositionAsync({});
+      const newOrigin = {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      };
+      
+      setOrigin(newOrigin);
+      setRegion(prev => ({
+        ...prev,
+        latitude: newOrigin.latitude,
+        longitude: newOrigin.longitude,
+      }));
+
+      if (destination) {
+        await fetchRoute(destination);
+      }
+
+    } catch (error) {
+      console.error('Erro ao obter localização:', error);
+      setErrorMsg('Não foi possível atualizar a localização');
+    } finally {
+      setLoading(false);
     }
-
-    let location = await Location.getCurrentPositionAsync({});
-    const userLocation = {
-      latitude: location.coords.latitude,
-      longitude: location.coords.longitude,
-    };
-
-    setOrigin(userLocation);
-
-    if (destination) {
-      fetchRoute(userLocation);
-    }
-  };
-
-  const calculateDistance = (lat1, lon1, lat2, lon2) => {
-    const toRad = (value) => value * Math.PI / 180;
-
-    const R = 6378; // Raio da Terra em quilômetros
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    const distance = R * c; // Distância em quilômetros
-
-    return distance.toFixed(2); // Retorna a distância com 2 casas decimais
   };
 
   return (
     <View style={styles.container}>
+      {/* Barra de busca */}
       <View style={styles.searchContainer}>
         <TextInput
           style={styles.input}
-          placeholder="Buscar local..."
+          placeholder="Digite um endereço"
           value={searchQuery}
           onChangeText={setSearchQuery}
-          placeholderTextColor="#888"
+          placeholderTextColor="#999"
+          onSubmitEditing={searchLocation}
         />
-        <TouchableOpacity style={styles.button} onPress={searchLocation}>
+        <TouchableOpacity
+          style={styles.searchButton}
+          onPress={searchLocation}
+          disabled={loading}
+        >
           <Text style={styles.buttonText}>Buscar</Text>
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity style={styles.locateButton} onPress={locateMe}>
+      {/* Botão de localização */}
+      <TouchableOpacity
+        style={styles.locateButton}
+        onPress={locateMe}
+        disabled={loading}
+      >
         <Text style={styles.buttonText}>Minha Localização</Text>
       </TouchableOpacity>
 
-      {loading ? (
-        <ActivityIndicator size="large" color="#3498db" style={styles.loader} />
-      ) : (
-        location ? (
-          <MapView
-            style={styles.map}
-            region={location}
-            onPress={handlePress} // Seleção de pontos no mapa
-          >
-            {origin && <Marker coordinate={origin} title="Origem" />}
-            {destination && <Marker coordinate={destination} title="Destino" />}
-            {route.length > 0 && <Polyline coordinates={route} strokeColor="#3498db" strokeWidth={3} />}
-          </MapView>
-        ) : (
-          <Text style={styles.errorMsg}>{errorMsg || "Localização não encontrada"}</Text>
-        )
+      {/* Mapa */}
+      <MapView
+        ref={mapRef}
+        style={styles.map}
+        region={region}
+        showsUserLocation={true}
+        showsMyLocationButton={false}
+        onPress={(e) => {
+          const newDestination = e.nativeEvent.coordinate;
+          setDestination(newDestination);
+          fetchRoute(newDestination);
+        }}
+      >
+        {origin && (
+          <Marker
+            coordinate={origin}
+            title="Sua Localização"
+            pinColor={Platform.OS === 'android' ? '#3498db' : undefined}
+          />
+        )}
+        {destination && (
+          <Marker
+            coordinate={destination}
+            title="Destino"
+            pinColor={Platform.OS === 'android' ? '#e74c3c' : undefined}
+          />
+        )}
+        {route.length > 0 && (
+          <Polyline
+            coordinates={route}
+            strokeColor="#3498db"
+            strokeWidth={4}
+          />
+        )}
+      </MapView>
+
+      {/* Loader */}
+      {loading && (
+        <ActivityIndicator
+          size="large"
+          color="#3498db"
+          style={styles.loader}
+        />
       )}
 
-      {/* Exibir distância */}
+      {/* Distância */}
       {distance && (
-        <Text style={styles.distanceText}>
-          Distância: {distance} km
-        </Text>
+        <View style={styles.distanceContainer}>
+          <Text style={styles.distanceText}>Distância: {distance}</Text>
+        </View>
+      )}
+
+      {/* Mensagem de erro */}
+      {errorMsg && !loading && (
+        <View style={styles.errorContainer}>
+          <Text style={styles.errorText}>{errorMsg}</Text>
+        </View>
       )}
     </View>
   );
 };
 
+// Estilos
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f8f9fa',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 15,
+  },
+  map: {
+    flex: 1,
   },
   searchContainer: {
+    position: 'absolute',
+    top: 20,
+    left: 20,
+    right: 20,
     flexDirection: 'row',
-    backgroundColor: '#fff',
+    backgroundColor: 'white',
     borderRadius: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    alignItems: 'center',
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.1,
+    padding: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
     shadowRadius: 4,
-    elevation: 3,
-    width: '100%',
-    maxWidth: 400,
-    marginBottom: 10,
+    elevation: 5,
+    zIndex: 1,
+    marginTop: 20,
   },
   input: {
     flex: 1,
     height: 40,
-    fontSize: 16,
-    color: '#333',
+    paddingHorizontal: 10,
   },
-  button: {
+  searchButton: {
     backgroundColor: '#3498db',
-    paddingVertical: 8,
-    paddingHorizontal: 15,
     borderRadius: 8,
+    padding: 10,
+    marginLeft: 10,
   },
   locateButton: {
-    backgroundColor: '#2ecc71',
-    paddingVertical: 8,
-    paddingHorizontal: 15,
+    position: 'absolute',
+    top: 80,
+    right: 20,
+    backgroundColor: '#282828',
     borderRadius: 8,
-    marginTop: 10,
+    padding: 10,
+    zIndex: 1,
+    marginTop: 30,
   },
   buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
+    color: 'white',
+    fontWeight: 'bold',
   },
-  map: {
-    width: '100%',
-    height: '75%',
-    borderRadius: 15,
-    overflow: 'hidden',
-  },
-  loader: {
-    marginTop: 20,
-  },
-  errorMsg: {
-    color: '#e74c3c',
-    fontSize: 16,
-    textAlign: 'center',
-    marginTop: 10,
+  distanceContainer: {
+    position: 'absolute',
+    bottom: 20,
+    alignSelf: 'center',
+    backgroundColor: 'white',
+    padding: 10,
+    borderRadius: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 5,
   },
   distanceText: {
-    fontSize: 18,
     fontWeight: 'bold',
-    marginTop: 20,
-    color: '#333',
-  }
+  },
+  errorContainer: {
+    position: 'absolute',
+    bottom: 70,
+    alignSelf: 'center',
+    backgroundColor: '#e74c3c',
+    padding: 10,
+    borderRadius: 10,
+  },
+  errorText: {
+    color: 'white',
+  },
+  loader: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+  },
 });
 
 export default MapScreen;
